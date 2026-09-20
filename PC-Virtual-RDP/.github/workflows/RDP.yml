@@ -1,0 +1,421 @@
+name: Menezes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Limpeza pesada do disco e mostrar configurações
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host " CONFIGURAÇÕES DO RUNNER"
+          Write-Host "========================================"
+
+          Write-Host "`n--- SISTEMA ---"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture |
+            Format-List
+
+          Write-Host "--- CPU ---"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            Format-List
+
+          Write-Host "--- RAM ---"
+          $ram = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("RAM total: {0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB))
+
+          Write-Host "`n--- GPU ---"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name,
+              @{N="VRAM_GB";E={
+                if ($_.AdapterRAM) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                } else {
+                  "N/A"
+                }
+              }},
+              DriverVersion |
+            Format-List
+
+          Write-Host "--- DISCOS (C e D) ANTES DA LIMPEZA ---"
+          Get-Volume -DriveLetter C,D -ErrorAction SilentlyContinue |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}},
+              @{N="UsadoGB";E={[math]::Round(($_.Size - $_.SizeRemaining) / 1GB, 2)}} |
+            Format-List
+
+          Write-Host "`n========================================"
+          Write-Host " INICIANDO LIMPEZA PESADA"
+          Write-Host "========================================"
+
+          # Arquivos temporários do usuário
+          Remove-Item "$env:TEMP\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Arquivos temporários do Windows
+          Remove-Item "C:\Windows\Temp\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Cache do Windows Update
+          Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\SoftwareDistribution\Download\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+          Start-Service wuauserv -ErrorAction SilentlyContinue
+
+          # Relatórios de erro do Windows
+          Remove-Item "C:\ProgramData\Microsoft\Windows\WER\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Cache temporário do usuário
+          Remove-Item "$env:LOCALAPPDATA\Temp\*" `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Cache do Chocolatey
+          if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
+              choco clean --yes
+          }
+
+          # Cache do NuGet
+          if (Get-Command dotnet.exe -ErrorAction SilentlyContinue) {
+              dotnet nuget locals all --clear
+          }
+
+          # Cache do pip
+          if (Get-Command pip.exe -ErrorAction SilentlyContinue) {
+              pip cache purge
+          }
+
+          # Cache do npm
+          if (Get-Command npm.cmd -ErrorAction SilentlyContinue) {
+              npm cache clean --force
+          }
+
+          # Limpeza de componentes antigos do Windows
+          DISM.exe /Online /Cleanup-Image /StartComponentCleanup
+
+          # Limpeza do Gerenciador de Disco
+          cleanmgr.exe /verylowdisk
+
+          Write-Host "`n========================================"
+          Write-Host " RESULTADO DA LIMPEZA"
+          Write-Host "========================================"
+
+          Get-Volume -DriveLetter C,D -ErrorAction SilentlyContinue |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}},
+              @{N="UsadoGB";E={[math]::Round(($_.Size - $_.SizeRemaining) / 1GB, 2)}} |
+            Format-List
+
+          Write-Host "`n========================================"
+          Write-Host " CONFIGURAÇÕES FINAIS"
+          Write-Host "========================================"
+
+          Write-Host "`n--- CPU ---"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            Format-List
+
+          Write-Host "--- RAM ---"
+          $ram = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("RAM total: {0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB))
+
+          Write-Host "`n--- GPU ---"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name,
+              @{N="VRAM_GB";E={
+                if ($_.AdapterRAM) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                } else {
+                  "N/A"
+                }
+              }},
+              DriverVersion |
+            Format-List
+
+          Write-Host "--- DISCOS (C e D) ---"
+          Get-Volume -DriveLetter C,D -ErrorAction SilentlyContinue |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}} |
+            Format-List
+
+      - name: Redirecionar instalações e caches para o disco D
+        run: |
+          if (-not (Test-Path "D:\")) {
+              Write-Error "Disco D não encontrado neste runner"
+              exit 1
+          }
+
+          # Pastas no D
+          $pastas = @(
+              "D:\Temp",
+              "D:\Downloads",
+              "D:\Program Files",
+              "D:\Program Files (x86)",
+              "D:\SteamLibrary",
+              "D:\Cache\pip",
+              "D:\Cache\npm",
+              "D:\Cache\nuget"
+          )
+          foreach ($pasta in $pastas) {
+              New-Item -ItemType Directory -Path $pasta -Force | Out-Null
+          }
+
+          # Pasta padrão de instalação de programas (Program Files) apontando para o D
+          $chave64 = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion"
+          Set-ItemProperty -Path $chave64 -Name "ProgramFilesDir"        -Value "D:\Program Files"
+          Set-ItemProperty -Path $chave64 -Name "ProgramFilesDir (x86)"  -Value "D:\Program Files (x86)"
+          Set-ItemProperty -Path $chave64 -Name "ProgramW6432Dir"        -Value "D:\Program Files"
+
+          $chave32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion"
+          Set-ItemProperty -Path $chave32 -Name "ProgramFilesDir"        -Value "D:\Program Files (x86)"
+          Set-ItemProperty -Path $chave32 -Name "ProgramFilesDir (x86)"  -Value "D:\Program Files (x86)"
+          Set-ItemProperty -Path $chave32 -Name "ProgramW6432Dir"        -Value "D:\Program Files"
+
+          # Temporários e caches no D (vale para os próximos passos e para o sistema)
+          $variaveis = @{
+              "TEMP"             = "D:\Temp"
+              "TMP"              = "D:\Temp"
+              "PIP_CACHE_DIR"    = "D:\Cache\pip"
+              "npm_config_cache" = "D:\Cache\npm"
+              "NUGET_PACKAGES"   = "D:\Cache\nuget"
+          }
+          foreach ($v in $variaveis.GetEnumerator()) {
+              [Environment]::SetEnvironmentVariable($v.Key, $v.Value, "Machine")
+              "$($v.Key)=$($v.Value)" >> $env:GITHUB_ENV
+          }
+
+          Write-Host "Instalações, temporários e caches direcionados para o disco D"
+          Write-Host "Biblioteca da Steam sugerida: D:\SteamLibrary"
+
+      - name: Instalar e ativar o Windows em Português (Brasil)
+        shell: powershell
+        run: |
+          function Tentar($nome, [scriptblock]$acao) {
+              try {
+                  & $acao
+                  Write-Host "OK: $nome"
+              } catch {
+                  Write-Warning "Falhou: $nome - $($_.Exception.Message)"
+              }
+          }
+
+          Write-Host "Instalando o pacote de idioma pt-BR (pode levar alguns minutos)..."
+          $instalou = $false
+          try {
+              Install-Language -Language pt-BR -ErrorAction Stop | Out-Host
+              $instalou = $true
+          } catch {
+              Write-Warning "Install-Language falhou: $($_.Exception.Message)"
+          }
+
+          if (-not $instalou) {
+              Tentar "Recursos de idioma pt-BR (método alternativo)" {
+                  Add-WindowsCapability -Online -Name "Language.Basic~~~pt-BR~0.0.1.0" -ErrorAction Stop | Out-Host
+              }
+          }
+
+          Tentar "Idioma de exibição" {
+              Set-WinUILanguageOverride -Language pt-BR -ErrorAction Stop
+          }
+          Tentar "Lista de idiomas e teclado ABNT2" {
+              Set-WinUserLanguageList -LanguageList (New-WinUserLanguageList -Language pt-BR) -Force -ErrorAction Stop
+          }
+          Tentar "Método de entrada padrão (ABNT2)" {
+              Set-WinDefaultInputMethodOverride -InputTip "0416:00010416" -ErrorAction Stop
+          }
+          Tentar "Formato regional (data, hora e moeda)" {
+              Set-Culture -CultureInfo pt-BR -ErrorAction Stop
+          }
+          Tentar "Idioma do sistema" {
+              Set-WinSystemLocale -SystemLocale pt-BR -ErrorAction Stop
+          }
+          Tentar "País ou região (Brasil)" {
+              Set-WinHomeLocation -GeoId 32 -ErrorAction Stop
+          }
+          Tentar "Idioma preferido do sistema" {
+              Set-SystemPreferredUILanguage -Language pt-BR -ErrorAction Stop
+          }
+          Tentar "Copiar idioma para tela de login e novos usuários" {
+              Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true -ErrorAction Stop
+          }
+
+      - name: Ajustar perfil padrão dos novos usuários (português e temporários no D)
+        shell: powershell
+        run: |
+          $hive = "HKU\PerfilPadrao"
+
+          reg load $hive "C:\Users\Default\NTUSER.DAT" | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Não foi possível carregar o perfil padrão do Windows"
+              exit 0
+          }
+
+          # Idioma de exibição em português para quem entrar pela primeira vez
+          reg add "$hive\Control Panel\Desktop" /v PreferredUILanguages /t REG_MULTI_SZ /d "pt-BR" /f | Out-Null
+
+          # Pasta temporária do usuário no D
+          reg add "$hive\Environment" /v TEMP /t REG_EXPAND_SZ /d "D:\Temp" /f | Out-Null
+          reg add "$hive\Environment" /v TMP  /t REG_EXPAND_SZ /d "D:\Temp" /f | Out-Null
+
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload $hive | Out-Null
+
+          Write-Host "Perfil padrão ajustado"
+
+      - name: Configurar as opções principais do RDP
+        run: |
+          # Habilitar Área de Trabalho Remota e desativar a autenticação em nível de rede (NLA)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remover regra antiga com o mesmo nome para evitar duplicidade
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Liberar conexões de entrada na porta 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Reiniciar o serviço de Área de Trabalho Remota
+          Restart-Service -Name TermService -Force
+
+      - name: Criar o usuário Menezes com senha segura
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "Menezes" `
+                        -Password $securePass `
+                        -AccountNeverExpires
+
+          Add-LocalGroupMember -Group "Administrators" -Member "Menezes"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Menezes"
+
+          echo "RDP_USUARIO=Menezes" >> $env:GITHUB_ENV
+          echo "RDP_SENHA=$password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "Menezes")) {
+              Write-Error "Falha ao criar o usuário"
+              exit 1
+          }
+
+      - name: Instalar o Tailscale no disco D
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $instalador = "D:\Downloads\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $instalador
+
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$instalador`"", "INSTALLDIR=`"D:\Program Files\Tailscale`"", "/quiet", "/norestart" `
+            -Wait -PassThru
+
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              Write-Error "Falha ao instalar o Tailscale (código $($proc.ExitCode))"
+              exit 1
+          }
+
+          Remove-Item $instalador -Force
+
+          # Localizar o executável (D ou C, dependendo do instalador)
+          $exe = @(
+              "D:\Program Files\Tailscale\tailscale.exe",
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "C:\Program Files\Tailscale\tailscale.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $exe) {
+              Write-Error "tailscale.exe não encontrado após a instalação"
+              exit 1
+          }
+
+          Write-Host "Tailscale instalado em: $exe"
+          echo "TAILSCALE_EXE=$exe" >> $env:GITHUB_ENV
+
+      - name: Conectar ao Tailscale
+        run: |
+          # Ligar o Tailscale
+          & $env:TAILSCALE_EXE up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Aguardar o Tailscale atribuir um IP
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & $env:TAILSCALE_EXE ip -4
+
+              if ($tsIP) {
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "O Tailscale não atribuiu um IP. Encerrando."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verificar o acesso ao RDP
+        run: |
+          Write-Host "IP do Tailscale: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "Falha na conexão TCP com a porta 3389 do RDP"
+              exit 1
+          }
+
+          Write-Host "Conexão TCP realizada com sucesso!"
+
+      - name: Manter a conexão ativa
+        run: |
+          Write-Host "`n=== ACESSO RDP ==="
+          Write-Host "Endereço: $env:TAILSCALE_IP"
+          Write-Host "Usuário: $env:RDP_USUARIO"
+          Write-Host "Senha: $env:RDP_SENHA"
+          Write-Host "==================`n"
+
+          # Manter o runner ativo
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP ativo"
+              Start-Sleep -Seconds 300
+          }
+          
