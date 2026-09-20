@@ -10,7 +10,7 @@ defaults:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 8600
 
     steps:
       - name: Preparar o sistema (configura enquanto o Tailscale baixa)
