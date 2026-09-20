@@ -1,0 +1,493 @@
+name: Menezes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Verificar se o processador é o Intel Xeon Platinum 8573C
+        shell: powershell
+        run: |
+          $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          Write-Host "Processador deste runner: $cpu"
+
+          if ($cpu -notmatch "8573C") {
+              Write-Error "Este runner veio com '$cpu' e não com o Intel Xeon Platinum 8573C. Cancelando; rode o workflow de novo."
+              exit 1
+          }
+
+          Write-Host "Intel Xeon Platinum 8573C confirmado"
+
+      - name: Limpeza pesada do disco e mostrar configurações
+        shell: powershell
+        run: |
+          Write-Host "=== SISTEMA ==="
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture | Format-List
+          Write-Host "=== CPU ==="
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-List
+          Write-Host "=== RAM ==="
+          $ram = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("RAM total: {0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB))
+          Write-Host "=== GPU ==="
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List
+          Write-Host "=== DISCOS ANTES DA LIMPEZA ==="
+          Get-Volume -DriveLetter C,D -ErrorAction SilentlyContinue |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}} | Format-List
+
+          Write-Host "=== INICIANDO LIMPEZA PESADA ==="
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Start-Service wuauserv -ErrorAction SilentlyContinue
+          Remove-Item "C:\ProgramData\Microsoft\Windows\WER\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:LOCALAPPDATA\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+          if (Get-Command choco.exe -ErrorAction SilentlyContinue) { choco clean --yes }
+          if (Get-Command dotnet.exe -ErrorAction SilentlyContinue) { dotnet nuget locals all --clear }
+          if (Get-Command pip.exe -ErrorAction SilentlyContinue) { pip cache purge }
+          if (Get-Command npm.cmd -ErrorAction SilentlyContinue) { npm cache clean --force }
+
+          DISM.exe /Online /Cleanup-Image /StartComponentCleanup
+          cleanmgr.exe /verylowdisk
+
+          Write-Host "=== RESULTADO DA LIMPEZA ==="
+          Get-Volume -DriveLetter C,D -ErrorAction SilentlyContinue |
+            Select-Object DriveLetter,
+              @{N="TamanhoGB";E={[math]::Round($_.Size / 1GB, 2)}},
+              @{N="LivreGB";E={[math]::Round($_.SizeRemaining / 1GB, 2)}} | Format-List
+
+      - name: Preparar pastas no disco D (só para coisas novas)
+        run: |
+          if (-not (Test-Path "D:\")) {
+              Write-Error "Disco D não encontrado neste runner"
+              exit 1
+          }
+
+          $pastas = @("D:\Downloads", "D:\Steam", "D:\SteamLibrary", "D:\GPU-Virtual")
+          foreach ($pasta in $pastas) {
+              New-Item -ItemType Directory -Path $pasta -Force | Out-Null
+              # Permissão para todos os usuários (o Menezes precisa gravar no D)
+              icacls $pasta /grant "*S-1-1-0:(OI)(CI)F" /T | Out-Null
+          }
+
+          Write-Host "Pastas do disco D prontas (nada foi movido do C)"
+
+      - name: Ajustar perfil padrão dos novos usuários (português e efeitos leves)
+        shell: powershell
+        run: |
+          $hive = "HKU\PerfilPadrao"
+
+          reg load $hive "C:\Users\Default\NTUSER.DAT" | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Não foi possível carregar o perfil padrão do Windows"
+              exit 0
+          }
+
+          reg add "$hive\Control Panel\Desktop" /v PreferredUILanguages /t REG_MULTI_SZ /d "pt-BR" /f | Out-Null
+
+          # Efeitos visuais no modo "melhor desempenho"
+          reg add "$hive\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+          reg add "$hive\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
+          reg add "$hive\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f | Out-Null
+          reg add "$hive\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ListviewAlphaSelect /t REG_DWORD /d 0 /f | Out-Null
+          reg add "$hive\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload $hive | Out-Null
+
+          Write-Host "Perfil padrão ajustado"
+
+      - name: Adicionar GPU virtual (Mesa3D llvmpipe, OpenGL 4.5)
+        continue-on-error: true
+        run: |
+          $destino = "D:\GPU-Virtual"
+          New-Item -ItemType Directory -Path "$destino\x64" -Force | Out-Null
+
+          $cabecalhos = @{
+              "User-Agent"    = "github-actions"
+              "Authorization" = "Bearer ${{ github.token }}"
+          }
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" `
+            -Headers $cabecalhos
+          $pacote = $release.assets |
+            Where-Object { $_.name -match "-release-msvc\.7z$" } |
+            Select-Object -First 1
+
+          if (-not $pacote) {
+              throw "Pacote release-msvc do Mesa3D não encontrado"
+          }
+
+          Write-Host "Baixando $($pacote.name)..."
+          $arquivo = "D:\Downloads\$($pacote.name)"
+          Invoke-WebRequest -Uri $pacote.browser_download_url -OutFile $arquivo
+
+          $sevenZip = @(
+              "C:\Program Files\7-Zip\7z.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $sevenZip) {
+              throw "7-Zip não encontrado"
+          }
+
+          & $sevenZip x $arquivo "-o$destino\mesa" -y | Out-Null
+          Remove-Item $arquivo -Force
+
+          $opengl = Get-ChildItem "$destino\mesa" -Recurse -Filter "opengl32.dll" |
+            Where-Object { $_.DirectoryName -match "x64$" } |
+            Select-Object -First 1
+
+          if (-not $opengl) {
+              throw "opengl32.dll (x64) não encontrado no pacote do Mesa3D"
+          }
+
+          Copy-Item "$($opengl.DirectoryName)\*" "$destino\x64" -Recurse -Force
+          Remove-Item "$destino\mesa" -Recurse -Force
+
+          $auxiliar = @'
+          param([string]$Pasta)
+
+          $origem = "D:\GPU-Virtual\x64"
+
+          if (-not $Pasta) {
+              $candidatos = @(
+                  "D:\SteamLibrary\steamapps\common\Euro Truck Simulator 2\bin\win_x64",
+                  "D:\Steam\steamapps\common\Euro Truck Simulator 2\bin\win_x64",
+                  "D:\Program Files (x86)\Steam\steamapps\common\Euro Truck Simulator 2\bin\win_x64"
+              )
+              $Pasta = $candidatos | Where-Object { Test-Path "$_\eurotrucks2.exe" } | Select-Object -First 1
+          }
+
+          if (-not $Pasta -or -not (Test-Path $Pasta)) {
+              Write-Host "Jogo não encontrado."
+              Write-Host "Use: Aplicar-GPU.ps1 -Pasta 'pasta onde está o .exe do jogo'"
+              Read-Host "Aperte Enter para sair"
+              exit 1
+          }
+
+          Copy-Item "$origem\*" $Pasta -Recurse -Force
+          Write-Host "GPU virtual aplicada em: $Pasta"
+          Write-Host "Na Steam, abra Propriedades > Opções de inicialização e coloque: -opengl"
+          Read-Host "Aperte Enter para sair"
+          '@
+          Set-Content -Path "$destino\Aplicar-GPU.ps1" -Value $auxiliar -Encoding utf8BOM
+
+          $atalho = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\Aplicar GPU virtual no jogo.lnk")
+          $atalho.TargetPath = "powershell.exe"
+          $atalho.Arguments = "-ExecutionPolicy Bypass -File `"$destino\Aplicar-GPU.ps1`""
+          $atalho.Save()
+
+          # Ajustes do llvmpipe: usa todos os núcleos e libera OpenGL 4.5 para os jogos
+          $nucleos = [string][Environment]::ProcessorCount
+          $gpuVars = @{
+              "GALLIUM_DRIVER"             = "llvmpipe"
+              "LP_NUM_THREADS"             = $nucleos
+              "MESA_GL_VERSION_OVERRIDE"   = "4.5COMPAT"
+              "MESA_GLSL_VERSION_OVERRIDE" = "450"
+          }
+          foreach ($v in $gpuVars.GetEnumerator()) {
+              [Environment]::SetEnvironmentVariable($v.Key, $v.Value, "Machine")
+              Add-Content -Path $env:GITHUB_ENV -Value "$($v.Key)=$($v.Value)" -Encoding utf8
+          }
+
+          Write-Host "GPU virtual pronta em $destino"
+
+      - name: Preparar ajuste do GTA V (aviso de memória de vídeo)
+        continue-on-error: true
+        run: |
+          $auxiliar = @'
+          param([string]$Pasta)
+
+          if (-not $Pasta) {
+              $raizes = @("D:\Downloads", "D:\SteamLibrary", "D:\Steam", "$env:USERPROFILE\Downloads")
+              foreach ($r in $raizes) {
+                  if (Test-Path $r) {
+                      $exe = Get-ChildItem $r -Recurse -Filter "GTA5.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+                      if ($exe) { $Pasta = $exe.DirectoryName; break }
+                  }
+              }
+          }
+
+          if (-not $Pasta -or -not (Test-Path "$Pasta\GTA5.exe")) {
+              Write-Host "GTA5.exe não encontrado."
+              Write-Host "Use: Ajustar-GTAV.ps1 -Pasta 'pasta onde está o GTA5.exe'"
+              Read-Host "Aperte Enter para sair"
+              exit 1
+          }
+
+          # Ignora a checagem de placa/memória de vídeo e os limites de memória do menu gráfico
+          $flags = @("-ignoreDifferentVideoCard", "-nomemrestrict", "-norestrictions")
+          Set-Content -Path "$Pasta\commandline.txt" -Value $flags -Encoding ascii
+
+          Write-Host "commandline.txt criado em: $Pasta"
+          Write-Host "Abra o GTA V e, no aviso de memória de vídeo, clique em OK (não em Cancel)."
+          Read-Host "Aperte Enter para sair"
+          '@
+          Set-Content -Path "D:\GPU-Virtual\Ajustar-GTAV.ps1" -Value $auxiliar -Encoding utf8BOM
+
+          $atalho = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\Ajustar GTA V.lnk")
+          $atalho.TargetPath = "powershell.exe"
+          $atalho.Arguments = "-ExecutionPolicy Bypass -File `"D:\GPU-Virtual\Ajustar-GTAV.ps1`""
+          $atalho.Save()
+
+          Write-Host "Atalho 'Ajustar GTA V' criado na área de trabalho"
+
+      - name: Configurar as opções principais do RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # RDP mais fluido: codec H.264/AVC 444 e transporte UDP
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $pol -Force | Out-Null
+          Set-ItemProperty -Path $pol -Name "AVC444ModePreferred"    -Value 1 -Type DWord
+          Set-ItemProperty -Path $pol -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord
+          Set-ItemProperty -Path $pol -Name "SelectTransport"        -Value 0 -Type DWord
+          Set-ItemProperty -Path $pol -Name "fEnableVirtualizedGraphics" -Value 1 -Type DWord
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale-UDP" `
+            dir=in action=allow protocol=UDP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Criar o usuário Menezes com senha segura
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "Menezes" `
+                        -Password $securePass `
+                        -AccountNeverExpires
+
+          Add-LocalGroupMember -Group "Administrators" -Member "Menezes"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Menezes"
+
+          echo "RDP_USUARIO=Menezes" >> $env:GITHUB_ENV
+          echo "RDP_SENHA=$password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "Menezes")) {
+              Write-Error "Falha ao criar o usuário"
+              exit 1
+          }
+
+      - name: Instalar o Tailscale no disco D
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $instalador = "D:\Downloads\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $instalador
+
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$instalador`"", "INSTALLDIR=`"D:\Program Files\Tailscale`"", "/quiet", "/norestart" `
+            -Wait -PassThru
+
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              Write-Error "Falha ao instalar o Tailscale (código $($proc.ExitCode))"
+              exit 1
+          }
+
+          Remove-Item $instalador -Force
+
+          $exe = @(
+              "D:\Program Files\Tailscale\tailscale.exe",
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "C:\Program Files\Tailscale\tailscale.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $exe) {
+              Write-Error "tailscale.exe não encontrado após a instalação"
+              exit 1
+          }
+
+          Write-Host "Tailscale instalado em: $exe"
+          echo "TAILSCALE_EXE=$exe" >> $env:GITHUB_ENV
+
+      - name: Instalar a Steam no disco D
+        run: |
+          $instalador = "D:\Downloads\SteamSetup.exe"
+          Invoke-WebRequest `
+            -Uri "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe" `
+            -OutFile $instalador
+
+          # /D precisa ser o último argumento e sem aspas
+          $proc = Start-Process $instalador -ArgumentList "/S", "/D=D:\Steam" -Wait -PassThru
+
+          if (-not (Test-Path "D:\Steam\steam.exe")) {
+              Write-Error "Steam não foi instalada (código $($proc.ExitCode))"
+              exit 1
+          }
+          Remove-Item $instalador -Force
+
+          $atalho = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\Steam.lnk")
+          $atalho.TargetPath = "D:\Steam\steam.exe"
+          $atalho.WorkingDirectory = "D:\Steam"
+          $atalho.Save()
+
+          Write-Host "Steam instalada em D:\Steam (biblioteca sugerida: D:\SteamLibrary)"
+
+      - name: Instalar componentes para jogos (DirectX e Visual C++)
+        continue-on-error: true
+        run: |
+          choco install directx vcredist-all -y --no-progress --limit-output
+
+      - name: Otimizar o Windows para desempenho
+        continue-on-error: true
+        run: |
+          # Plano de energia: alto desempenho
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /h off
+
+          # Antivírus não precisa vasculhar jogos e caches
+          try {
+              Add-MpPreference -ExclusionPath "D:\" -ErrorAction Stop
+              Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+              Write-Host "Defender: monitoramento em tempo real desativado"
+          } catch {
+              Write-Warning "Defender não permitiu a alteração: $($_.Exception.Message)"
+          }
+
+          # Serviços que só consomem CPU/disco aqui
+          foreach ($svc in @("SysMain", "WSearch", "DiagTrack", "wuauserv", "UsoSvc", "WerSvc", "MapsBroker")) {
+              Stop-Service $svc -Force -ErrorAction SilentlyContinue
+              Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Efeitos visuais leves para a máquina e para o usuário atual
+          Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+            -Name "VisualFXSetting" -Value 2 -ErrorAction SilentlyContinue
+
+          # Rede: desliga o auto-ajuste que às vezes derruba a velocidade
+          netsh int tcp set global autotuninglevel=normal | Out-Null
+
+          Write-Host "Otimizações aplicadas"
+
+      - name: Verificar assinatura de drivers (Driver Signature Enforcement)
+        continue-on-error: true
+        shell: powershell
+        run: |
+          Write-Host "=== Configuração de boot atual ==="
+          bcdedit /enum '{current}'
+
+          $desativada = bcdedit /enum '{current}' | Select-String -Pattern "testsigning\s+Yes|nointegritychecks\s+Yes"
+          if ($desativada) {
+              Write-Warning "A assinatura de drivers está DESATIVADA neste runner"
+              bcdedit /set testsigning off | Out-Null
+              bcdedit /set nointegritychecks off | Out-Null
+              Write-Warning "A mudança só vale depois de reiniciar, e reiniciar derruba o runner do GitHub. Jogos com anti-cheat (Denuvo) vão continuar bloqueando."
+          } else {
+              Write-Host "O bcdedit não mostra a assinatura desativada; se o anti-cheat ainda reclamar, o bloqueio vem do ambiente da VM."
+          }
+
+      - name: Conectar ao Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          Write-Host "========================================"
+          Write-Host " CONECTANDO AO TAILSCALE"
+          Write-Host "========================================"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+              Write-Error "TAILSCALE_AUTH_KEY não está configurada nas Secrets do GitHub."
+              exit 1
+          }
+
+          Write-Host "Iniciando Tailscale..."
+
+          & $env:TAILSCALE_EXE up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Falha ao conectar ao Tailscale. Código: $LASTEXITCODE"
+              exit 1
+          }
+
+          Write-Host "Tailscale conectado."
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & $env:TAILSCALE_EXE ip -4 2>$null
+
+              if ($tsIP) {
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "O Tailscale não atribuiu um IP."
+              exit 1
+          }
+
+          $tsIP = $tsIP.Trim()
+
+          Write-Host "TAILSCALE IP: $tsIP"
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verificar o acesso ao RDP
+        run: |
+          Write-Host "IP do Tailscale: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "Falha na conexão TCP com a porta 3389 do RDP"
+              exit 1
+          }
+
+          Write-Host "Conexão TCP realizada com sucesso!"
+
+      - name: Manter a conexão ativa
+        run: |
+          Write-Host "`n=== ACESSO RDP ==="
+          Write-Host "Endereço: $env:TAILSCALE_IP"
+          Write-Host "Usuário: $env:RDP_USUARIO"
+          Write-Host "Senha: $env:RDP_SENHA"
+          Write-Host "Steam: D:\Steam | GPU virtual: D:\GPU-Virtual (atalho na área de trabalho)"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP ativo"
+              Start-Sleep -Seconds 300
+          }
